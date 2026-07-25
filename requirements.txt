@@ -1,0 +1,7 @@
+rendercv[full]
+fastapi
+uvicorn
+supabase
+python-multipart
+pyyaml
+requests
