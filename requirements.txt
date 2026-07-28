@@ -5,3 +5,6 @@ supabase
 python-multipart
 pyyaml
 requests
+google-api-python-client
+google-auth
+google-auth-httplib2

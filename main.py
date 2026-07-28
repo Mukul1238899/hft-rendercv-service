@@ -5,12 +5,86 @@ from pydantic import BaseModel
 from supabase import create_client
 import typst
 
+# ── Google Drive (ADDED) ──────────────────────────────────
+from google.oauth2.credentials import Credentials as GoogleCredentials
+from googleapiclient.discovery import build as gbuild
+from googleapiclient.http import MediaFileUpload
+
 app = FastAPI()
 
 supabase = create_client(
     os.environ.get("SUPABASE_URL"),
     os.environ.get("SUPABASE_SERVICE_KEY")
 )
+
+# ── Google Drive config (ADDED) ───────────────────────────
+GDRIVE_CLIENT_ID     = os.environ.get("GOOGLE_DRIVE_CLIENT_ID")
+GDRIVE_CLIENT_SECRET = os.environ.get("GOOGLE_DRIVE_CLIENT_SECRET")
+GDRIVE_REFRESH_TOKEN = os.environ.get("GOOGLE_DRIVE_REFRESH_TOKEN")
+GDRIVE_ROOT_NAME     = os.environ.get("GDRIVE_ROOT_FOLDER_NAME", "HFT DocGen")
+_DRIVE_ENABLED = all([GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN])
+
+
+def _drive_service():
+    creds = GoogleCredentials(
+        token=None,
+        refresh_token=GDRIVE_REFRESH_TOKEN,
+        client_id=GDRIVE_CLIENT_ID,
+        client_secret=GDRIVE_CLIENT_SECRET,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+    return gbuild("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _find_folder(svc, name, parent_id=None):
+    esc = name.replace("'", "\\'")
+    q = ["mimeType = 'application/vnd.google-apps.folder'", "trashed = false", f"name = '{esc}'"]
+    if parent_id:
+        q.append(f"'{parent_id}' in parents")
+    res = svc.files().list(q=" and ".join(q), spaces="drive",
+                           fields="files(id,name)", pageSize=5).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def _folder(svc, name, parent_id=None, share_anyone=False):
+    fid = _find_folder(svc, name, parent_id)
+    if fid:
+        return fid
+    meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
+    if parent_id:
+        meta["parents"] = [parent_id]
+    folder = svc.files().create(body=meta, fields="id").execute()
+    fid = folder["id"]
+    if share_anyone:
+        try:
+            svc.permissions().create(fileId=fid, body={"role": "reader", "type": "anyone"}).execute()
+        except Exception as e:
+            print(f"⚠️ Drive share warn: {e}")
+    return fid
+
+
+def _upload_to_drive(pdf_path, filename, client_folder_name):
+    """Upload a PDF into  HFT DocGen / <client> /  and return (file_link, folder_link).
+    Per-customer folder is shared anyone-with-link once, on creation."""
+    svc = _drive_service()
+    root_id = _folder(svc, GDRIVE_ROOT_NAME)                                   # app-created root
+    client_id = _folder(svc, client_folder_name, root_id, share_anyone=True)   # per-customer, link-shared
+    # upsert by filename inside the client folder (retries overwrite, never duplicate)
+    existing = svc.files().list(
+        q=f"name = '{filename}' and '{client_id}' in parents and trashed = false",
+        spaces="drive", fields="files(id)", pageSize=1).execute().get("files", [])
+    media = MediaFileUpload(pdf_path, mimetype="application/pdf", resumable=False)
+    if existing:
+        f = svc.files().update(fileId=existing[0]["id"], media_body=media,
+                               fields="id,webViewLink").execute()
+    else:
+        f = svc.files().create(body={"name": filename, "parents": [client_id]},
+                               media_body=media, fields="id,webViewLink").execute()
+    folder_link = f"https://drive.google.com/drive/folders/{client_id}"
+    return f.get("webViewLink"), folder_link
+
 
 # ── Section Alias Map ─────────────────────────────────────
 SECTION_ALIASES = {
@@ -36,6 +110,7 @@ SECTION_ALIASES = {
         "educational_background", "education_and_credentials"
     ]
 }
+
 
 def normalize_sections(data):
     """Normalize section names using alias map"""
@@ -68,6 +143,7 @@ def normalize_sections(data):
     data['cv']['sections'] = normalized
     return data
 
+
 def fix_yaml(yaml_text):
     # Remove markdown backticks
     yaml_text = yaml_text.replace("```yaml", "").replace("```", "").strip()
@@ -98,14 +174,17 @@ def fix_yaml(yaml_text):
 
     return yaml_text
 
+
 class CVRequest(BaseModel):
     batch_id: str
     candidate_name: str
     yaml_content: str
 
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "HFT RenderCV"}
+
 
 @app.post("/render")
 async def render_cv(req: CVRequest):
@@ -152,7 +231,7 @@ async def render_cv(req: CVRequest):
 
         print(f"PDF found: {pdf_path}")
 
-        # Upload Supabase
+        # Upload Supabase (UNCHANGED — keeps /download working)
         safe_name = re.sub(r'[^a-z0-9_]', '', req.candidate_name.lower().replace(" ", "_"))
         storage_path = f"cvs/{req.batch_id}/{safe_name}_cv.pdf"
         with open(pdf_path, "rb") as f:
@@ -163,13 +242,35 @@ async def render_cv(req: CVRequest):
 
         url = supabase.storage.from_("cv-files").get_public_url(storage_path)
         print(f"Done! URL: {url}")
-        return {"success": True, "pdf_url": url, "candidate": req.candidate_name}
+
+        # Upload to Google Drive (ADDED — additive, non-fatal on failure)
+        drive_url = None
+        drive_folder_url = None
+        if _DRIVE_ENABLED:
+            try:
+                fname = f"{safe_name}_cv.pdf"
+                drive_url, drive_folder_url = _upload_to_drive(pdf_path, fname, req.candidate_name)
+                print(f"Drive file: {drive_url}")
+                print(f"Drive folder: {drive_folder_url}")
+            except Exception as de:
+                print(f"⚠️ Drive upload failed (non-fatal): {de}")
+        else:
+            print("ℹ️ Drive disabled (missing GOOGLE_DRIVE_* env vars) — Supabase only.")
+
+        return {
+            "success": True,
+            "pdf_url": url,
+            "candidate": req.candidate_name,
+            "drive_url": drive_url,
+            "drive_folder_url": drive_folder_url,
+        }
 
     except Exception as e:
         print(f"ERROR: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     import uvicorn
